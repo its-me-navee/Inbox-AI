@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "inbox-ai"
+version = "0.4.0"
+description = "Warehouse mailbox intake, classification, and workflow automation"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+  "streamlit>=1.36.0",
+  "fastapi>=0.115.0",
+  "uvicorn[standard]>=0.30.0",
+  "pydantic>=2.8.0",
+  "langgraph>=0.2.0",
+  "langchain-groq>=0.2.0",
+  "google-api-python-client>=2.140.0",
+  "google-auth>=2.33.0",
+  "google-auth-oauthlib",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.3.0", "playwright>=1.61.0"]
+
+[tool.setuptools.packages.find]
+include = ["app*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]

@@ -1,0 +1,65 @@
+x-app-env: &app-env
+  env_file:
+    - .env
+  environment:
+    INBOX_AI_DATA_DIR: /app/data
+    GOOGLE_OAUTH_TOKEN_FILE: /app/data/gmail_token.json
+    GOOGLE_OAUTH_CLIENT_SECRETS: ${GOOGLE_OAUTH_CLIENT_SECRETS_CONTAINER:-/app/secrets/oauth_client.json}
+    GOOGLE_APPLICATION_CREDENTIALS: ${GOOGLE_APPLICATION_CREDENTIALS_CONTAINER:-}
+    GOOGLE_OAUTH_REDIRECT_URI: ${GOOGLE_OAUTH_REDIRECT_URI:-http://localhost:8501/oauth/gmail/callback}
+    GMAIL_OAUTH_SUCCESS_REDIRECT_URL: ${GMAIL_OAUTH_SUCCESS_REDIRECT_URL:-http://localhost:8502}
+    OAUTHLIB_INSECURE_TRANSPORT: ${OAUTHLIB_INSECURE_TRANSPORT:-}
+  volumes:
+    - ./data:/app/data
+    - ./secrets:/app/secrets:ro
+  restart: unless-stopped
+
+services:
+  api:
+    <<: *app-env
+    build: .
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8501 --proxy-headers --forwarded-allow-ips=*
+    ports:
+      - "127.0.0.1:8501:8501"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://localhost:8501/health', timeout=2)",
+        ]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  dashboard:
+    <<: *app-env
+    build: .
+    command: streamlit run app/dashboard/main.py --server.address 0.0.0.0 --server.port 8502
+    ports:
+      - "127.0.0.1:8502:8502"
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://localhost:8502/_stcore/health', timeout=2)",
+        ]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  poller:
+    <<: *app-env
+    build: .
+    command: python -m app.common.poller --loop --interval ${GMAIL_POLL_INTERVAL_SECONDS:-60} --max-results ${GMAIL_POLL_MAX_RESULTS:-10}
+    depends_on:
+      api:
+        condition: service_healthy
