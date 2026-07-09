@@ -26,6 +26,7 @@ The assistant will poll the inbox, classify the email, decide the correct workfl
 - Classifies mail into operational categories
 - Routes each case through a LangGraph workflow
 - Answers safe general enquiries from a local knowledge base
+- Forwards routed service requests to the operations team with a 2-hour SLA
 - Holds unclear or risky cases for manager review
 - Suppresses automated, promotional, or no-action emails
 - Stores cases, decisions, actions, and audit traces in SQLite
@@ -42,6 +43,11 @@ Gmail
 
 Optional safe reply
   -> Gmail send
+
+Routed service request
+  -> requester confirmation
+  -> internal team forward
+  -> 2-hour SLA timer
 ```
 
 Runtime services:
@@ -73,13 +79,16 @@ flowchart TD
     evidence -->|"Yes"| safeReply["Safe reply"]
     evidence -->|"No"| managerReview["Manager Review"]
 
-    service --> managerReview
+    service --> routeTeam["Forward to team"]
+    service --> requesterConfirm["Requester confirmation"]
     complaint --> managerReview
     escalation --> managerReview
     unknown --> managerReview
     noAction --> close["Close without reply"]
 
     safeReply --> caseAudit["Case Auditor"]
+    routeTeam --> caseAudit
+    requesterConfirm --> caseAudit
     managerReview --> caseAudit
     close --> caseAudit
 
@@ -91,7 +100,7 @@ flowchart TD
 Supported branches:
 
 - `General Enquiry`: answers from the knowledge base only when evidence is strong
-- `Service Request`: extracts operational details and prepares routing
+- `Service Request`: extracts operational details, forwards the case to the team, confirms receipt to the requester, and sets a 2-hour SLA
 - `Complaint`: prepares manager-facing review actions
 - `Escalation`: flags urgent warehouse issues for human attention
 - `No Action`: closes newsletters, receipts, automated alerts, and unrelated mail
@@ -103,8 +112,10 @@ Inbox AI does not blindly answer every email.
 
 - If the knowledge base cannot answer a General Enquiry, the case goes to human review.
 - Complaint, Escalation, Unknown, and Needs Human cases are not auto-sent.
+- Routed Service Requests can send a requester confirmation and an internal team forward.
 - No Action emails are logged and closed without a reply.
 - Every case keeps an agent trace so the decision can be inspected.
+- Cases confirmed by the manager leave the dashboard queues but remain stored in SQLite for audit.
 
 ## Run Locally
 

@@ -480,14 +480,16 @@ def reply_subject(subject: str) -> str:
     return f"Re: {clean_subject}"
 
 
-def validate_gmail_send_content(recipient: str, body: str) -> str:
+def validate_gmail_send_content(recipient: str, body: str, *, allow_internal: bool = False) -> str:
     if not recipient.strip():
         return "Cannot send Gmail reply without a recipient."
     content = clean_email_body(body)
     if not content:
         return "Cannot send an empty Gmail reply."
     lower = content.lower()
-    if any(marker in content for marker in ("{{", "}}", "[[", "]]")) or re.search(r"\b(todo|tbd)\b", lower):
+    if not allow_internal and (
+        any(marker in content for marker in ("{{", "}}", "[[", "]]")) or re.search(r"\b(todo|tbd)\b", lower)
+    ):
         return "Reply contains unresolved placeholders."
     internal_markers = (
         "internal routing note",
@@ -496,7 +498,7 @@ def validate_gmail_send_content(recipient: str, body: str) -> str:
         "warehouse service request\nrequester:",
         "critical warehouse escalation\nrequester:",
     )
-    if any(marker in lower for marker in internal_markers):
+    if not allow_internal and any(marker in lower for marker in internal_markers):
         return "Reply appears to contain internal routing text."
     return ""
 
@@ -536,9 +538,9 @@ def send_gmail_reply(service: Any, original: GmailMessage, response_body: str) -
     }
 
 
-def build_raw_message(*, to: str, subject: str, body: str, sender: str | None = None) -> str:
+def build_raw_message(*, to: str, subject: str, body: str, sender: str | None = None, allow_internal: bool = False) -> str:
     load_env()
-    validation_error = validate_gmail_send_content(to, body)
+    validation_error = validate_gmail_send_content(to, body, allow_internal=allow_internal)
     if validation_error:
         raise ValueError(validation_error)
     message = EmailMessage()
@@ -551,14 +553,22 @@ def build_raw_message(*, to: str, subject: str, body: str, sender: str | None = 
     return base64.urlsafe_b64encode(message.as_bytes()).decode("utf-8").rstrip("=")
 
 
-def send_gmail_message(service: Any, *, to: str, subject: str, body: str, sender: str | None = None) -> dict[str, str]:
+def send_gmail_message(
+    service: Any,
+    *,
+    to: str,
+    subject: str,
+    body: str,
+    sender: str | None = None,
+    allow_internal: bool = False,
+) -> dict[str, str]:
     load_env()
     if dry_run_enabled():
         return {"sent_message_id": "dryrun", "thread_id": "dryrun"}
     user_id = os.getenv("GMAIL_USER_ID", "me")
     response = service.users().messages().send(
         userId=user_id,
-        body={"raw": build_raw_message(to=to, subject=subject, body=body, sender=sender)},
+        body={"raw": build_raw_message(to=to, subject=subject, body=body, sender=sender, allow_internal=allow_internal)},
     ).execute()
     return {
         "sent_message_id": str(response.get("id", "")),

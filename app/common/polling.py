@@ -12,6 +12,7 @@ from app.common.gmail import (
     credentials_configured,
     fetch_message,
     list_recent_message_ids,
+    send_gmail_message,
     send_gmail_reply,
     validate_gmail_send_content,
 )
@@ -27,6 +28,9 @@ class PollCounters:
     sent: int = 0
     not_sent: int = 0
     send_failed: int = 0
+    internal_sent: int = 0
+    internal_not_sent: int = 0
+    internal_send_failed: int = 0
 
     def record_send_result(self, *, sent: bool, failed: bool) -> None:
         if sent:
@@ -36,16 +40,30 @@ class PollCounters:
         else:
             self.not_sent += 1
 
+    def record_internal_result(self, *, sent: bool, failed: bool) -> None:
+        if sent:
+            self.internal_sent += 1
+        elif failed:
+            self.internal_send_failed += 1
+        else:
+            self.internal_not_sent += 1
+
     def add(self, other: "PollCounters") -> None:
         self.sent += other.sent
         self.not_sent += other.not_sent
         self.send_failed += other.send_failed
+        self.internal_sent += other.internal_sent
+        self.internal_not_sent += other.internal_not_sent
+        self.internal_send_failed += other.internal_send_failed
 
     def as_dict(self) -> dict[str, int]:
         return {
             "sent": self.sent,
             "not_sent": self.not_sent,
             "send_failed": self.send_failed,
+            "internal_sent": self.internal_sent,
+            "internal_not_sent": self.internal_not_sent,
+            "internal_send_failed": self.internal_send_failed,
         }
 
 
@@ -58,6 +76,9 @@ def _empty_result(status: str, note: str) -> dict[str, Any]:
         "sent": 0,
         "not_sent": 0,
         "send_failed": 0,
+        "internal_sent": 0,
+        "internal_not_sent": 0,
+        "internal_send_failed": 0,
         "case_ids": [],
         "errors": [],
         "note": note,
@@ -185,7 +206,7 @@ def apply_send_policy(service: Any, message: GmailMessage, case: CaseResult) -> 
             case_id=case.id,
             sent_message_id=case.sent_message_id or "unknown",
         )
-        case.log.append(f"Outbound reply sent: {case.sent_message_id or 'unknown message id'}")
+        case.log.append("Outbound reply sent.")
         return True, False
     except Exception as exc:
         case.outbound_status = "failed"
@@ -193,6 +214,107 @@ def apply_send_policy(service: Any, message: GmailMessage, case: CaseResult) -> 
         logger.exception("gmail_send_failed message_id=%s case_id=%s", message.message_id, case.id)
         case.log.append(f"Outbound reply failed: {case.send_error}")
         return False, True
+
+
+def internal_notification_target(case: CaseResult) -> tuple[str, str] | None:
+    settings = app_settings()
+    request_type = case.classification.request_type
+    if request_type == "Service Request" and case.status == "Routed":
+        return settings.dock_planning_email, "Dock planning"
+    if request_type == "Complaint":
+        return settings.ops_lead_email, "Operations lead"
+    if request_type == "Escalation":
+        return settings.supervisor_email, "Warehouse supervisor"
+    if case.status == "Needs Human":
+        return settings.manager_email, "Manager review"
+    return None
+
+
+def compact_email_subject(value: str, *, limit: int = 96) -> str:
+    clean = " ".join((value or "(no subject)").split())
+    return clean if len(clean) <= limit else f"{clean[: limit - 3]}..."
+
+
+def internal_notification_subject(case: CaseResult, team: str) -> str:
+    return f"Fwd: {compact_email_subject(case.subject)}"
+
+
+def internal_notification_body(case: CaseResult, message: GmailMessage, team: str) -> str:
+    original_body = message.body.strip() or case.body.strip() or "(empty)"
+    if len(original_body) > 4000:
+        original_body = f"{original_body[:4000]}\n\n[Original email truncated]"
+    requester = case.requester or message.requester or "unknown"
+    subject = case.subject or message.subject or "(no subject)"
+    received = case.received_at or message.received_at or "unknown"
+    return (
+        f"Hi {team} team,\n\n"
+        "Please look into this matter.\n\n"
+        "---------- Forwarded message ---------\n"
+        f"From: {requester}\n"
+        f"Received: {received}\n"
+        f"Subject: {subject}\n\n"
+        f"{original_body}"
+    )
+
+
+def apply_internal_notification_policy(service: Any, message: GmailMessage, case: CaseResult) -> tuple[bool, bool, bool]:
+    target = internal_notification_target(case)
+    if not target:
+        case.internal_notification_status = "not_applicable"
+        case.internal_notification_reason = "No internal team notification required for this case."
+        return False, False, False
+
+    settings = app_settings()
+    recipient, team = target
+    case.internal_notification_to = recipient
+    if not settings.auto_send_enabled:
+        case.internal_notification_status = "not_sent"
+        case.internal_notification_reason = "Auto-send is disabled by production safety settings."
+        case.log.append(f"Internal notification skipped: {case.internal_notification_reason}")
+        return False, False, True
+    if case.classification.request_type == "Service Request" and not settings.auto_send_service_request:
+        case.internal_notification_status = "not_sent"
+        case.internal_notification_reason = "Service request team forwarding is disabled."
+        case.log.append(f"Internal notification skipped: {case.internal_notification_reason}")
+        return False, False, True
+    if not recipient.strip():
+        case.internal_notification_status = "not_sent"
+        case.internal_notification_reason = f"No {team} email is configured."
+        case.log.append(f"Internal notification skipped: {case.internal_notification_reason}")
+        return False, False, True
+
+    subject = internal_notification_subject(case, team)
+    body = internal_notification_body(case, message, team)
+    validation_error = validate_gmail_send_content(recipient, body, allow_internal=True)
+    if validation_error:
+        case.internal_notification_status = "not_sent"
+        case.internal_notification_reason = validation_error
+        case.log.append(f"Internal notification skipped: {validation_error}")
+        return False, False, True
+
+    try:
+        sent = send_gmail_message(service, to=recipient, subject=subject, body=body, allow_internal=True)
+        case.internal_notification_status = "sent"
+        case.internal_notification_message_id = sent.get("sent_message_id", "")
+        case.internal_notification_reason = f"Team forward sent to {team}."
+        log_event(
+            logger,
+            "gmail_internal_notification_success",
+            message_id=message.message_id,
+            case_id=case.id,
+            recipient=recipient,
+            team=team,
+            sent_message_id=case.internal_notification_message_id or "unknown",
+        )
+        case.log.append(f"Internal notification sent to {team} ({recipient}).")
+        return True, False, True
+    except Exception as exc:
+        case.internal_notification_status = "failed"
+        case.internal_notification_error = exc.__class__.__name__
+        case.internal_notification_reason = f"Team forward failed for {team}."
+        logger.exception("gmail_internal_notification_failed message_id=%s case_id=%s", message.message_id, case.id)
+        case.log.append(f"Internal notification failed: {case.internal_notification_error}")
+        return False, True, True
 
 
 def attach_gmail_metadata(case: CaseResult, message: GmailMessage) -> None:
@@ -265,6 +387,18 @@ def process_gmail_message(service: Any, message_id: str, *, query: str | None = 
         had_operational_error = True
         record_poll_error(message_id, "send", RuntimeError(case.send_error or "send_failed"), query)
 
+    internal_sent, internal_failed, internal_evaluated = apply_internal_notification_policy(service, message, case)
+    if internal_evaluated:
+        counters.record_internal_result(sent=internal_sent, failed=internal_failed)
+    if internal_failed:
+        had_operational_error = True
+        record_poll_error(
+            message_id,
+            "internal_send",
+            RuntimeError(case.internal_notification_error or "internal_send_failed"),
+            query,
+        )
+
     record = append_case(case, source="gmail", source_message_id=message.message_id)
     log_event(
         logger,
@@ -273,9 +407,12 @@ def process_gmail_message(service: Any, message_id: str, *, query: str | None = 
         case_id=record.get("id") if record else case.id,
         status=case.status,
         outbound_status=case.outbound_status,
+        internal_notification_status=case.internal_notification_status,
         sent=counters.sent,
         not_sent=counters.not_sent,
         send_failed=counters.send_failed,
+        internal_sent=counters.internal_sent,
+        internal_send_failed=counters.internal_send_failed,
     )
     if not had_operational_error:
         resolve_poll_errors_for_message(message_id)
@@ -345,6 +482,9 @@ def poll_gmail_once(*, max_results: int = 10, query: str | None = None) -> dict[
         sent=counters.sent,
         not_sent=counters.not_sent,
         send_failed=counters.send_failed,
+        internal_sent=counters.internal_sent,
+        internal_not_sent=counters.internal_not_sent,
+        internal_send_failed=counters.internal_send_failed,
     )
     return result
 
@@ -395,5 +535,7 @@ def retry_gmail_message(message_id: str, *, query: str | None = None) -> dict[st
         processed=result["processed"],
         sent=result["sent"],
         send_failed=result["send_failed"],
+        internal_sent=result["internal_sent"],
+        internal_send_failed=result["internal_send_failed"],
     )
     return result

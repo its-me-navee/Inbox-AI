@@ -17,7 +17,7 @@ flowchart LR
     end
 
     subgraph dashboard["Streamlit dashboard<br/>app/dashboard/main.py"]
-        sidebar["Sidebar controls<br/>Connect Gmail<br/>Sync now<br/>Auto-poll"]
+        topActions["Main actions<br/>Connect Gmail<br/>Poll Gmail"]
         inboxTab["Inbox Queue"]
         reviewTab["Manager Review"]
         repliesTab["Assistant Replies"]
@@ -77,7 +77,7 @@ flowchart LR
     manager --> dashboard
     apiClient --> fastapi
 
-    dashboard --> sidebar
+    dashboard --> topActions
     dashboard --> inboxTab
     dashboard --> reviewTab
     dashboard --> repliesTab
@@ -85,8 +85,9 @@ flowchart LR
     dashboard --> workflowTab
     dashboard --> setupTab
 
-    sidebar --> auth
-    sidebar --> pollOnce
+    topActions --> auth
+    topActions --> pollOnce
+    setupTab --> auth
     inboxTab --> casesTable
     reviewTab --> casesTable
     repliesTab --> casesTable
@@ -163,8 +164,8 @@ flowchart LR
 
     class manager,apiClient personClass
     class gmailInbox,googleOAuth,gmailAPI externalClass
-    class sidebar,inboxTab,reviewTab,repliesTab,metricsTab,workflowTab,setupTab,health,prodStatus,casesAPI,pollAPI,oauthCallback,auth,readMail,sendMail,pollOnce,query,duplicateGuard,processMessage,metadata,sendPolicy,pollErrors appClass
-    class graphEntry,reader,scanner,classifier,classAudit,branchNodes,outputAudit,caseResult workflowClass
+    class topActions,inboxTab,reviewTab,repliesTab,metricsTab,workflowTab,setupTab,health,prodStatus,casesAPI,pollAPI,oauthCallback,auth,readMail,sendMail,pollOnce,query,duplicateGuard,processMessage,metadata,sendPolicy,pollErrors appClass
+    class graphEntry,reader,classifier,classAudit,branchNodes,outputAudit,caseResult workflowClass
     class sqlite,casesTable,errorsTable,tokenFile,appLog dataClass
     class groq,prompts aiClass
     class kb,rules knowledgeClass
@@ -237,7 +238,7 @@ sequenceDiagram
     participant KB as Warehouse KB
     participant Store as SQLite Storage
 
-    UI->>Poller: Sync now, auto-poll, or POST /gmail/poll
+    UI->>Poller: Poll Gmail button, auto-poll, or POST /gmail/poll
     Poller->>Gmail: build service and list recent message ids
     loop each unseen message
         Poller->>Store: case_exists(source=gmail, message_id)
@@ -248,13 +249,16 @@ sequenceDiagram
         Graph-->>Poller: CaseResult
         Poller->>Poller: attach Gmail metadata and evaluate send_policy
         alt auto-send allowed
-            Poller->>Gmail: send_gmail_reply
+            Poller->>Gmail: send_gmail_reply to requester
         else held or blocked
             Poller->>Poller: set outbound_status and reason
         end
+        opt internal route required
+            Poller->>Gmail: send_gmail_message to team with routing details and original mail
+        end
         Poller->>Store: append_case
     end
-    Poller-->>UI: processed, skipped, failed, sent, not_sent
+    Poller-->>UI: processed, skipped, failed, sent, not_sent, internal_sent
 ```
 
 ### Manager Review Flow
@@ -294,7 +298,7 @@ sequenceDiagram
 |---|---|---|
 | `complaint` | `Needs Human` | Draft acknowledgement, escalate to operations lead, set follow-up |
 | `general_enquiry` | `Resolved` or `Needs Human` | Answer only when KB evidence is sufficient |
-| `service_request` | `Routed` or `Needs Human` | Extract request details, route to dock planning, set SLA |
+| `service_request` | `Routed` or `Needs Human` | Extract request details, send requester confirmation, forward details to dock planning, set 2-hour SLA |
 | `escalation` | `Needs Human` | Pause automation, prepare supervisor alert and urgent acknowledgement |
 | `no_action` | `No Action Closed` or `Needs Human` | Suppress outbound response when no-action signal is clear |
 | `unknown` | `Needs Human` | Hold automation and prepare a suggested reply |

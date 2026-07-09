@@ -15,6 +15,7 @@ from app.common.gmail import (
     send_gmail_reply,
     validate_gmail_send_content,
 )
+from app.common.polling import internal_notification_body, internal_notification_subject, internal_notification_target
 from app.common.storage import update_case
 from app.dashboard.ui.components import status_chip, status_label, type_chip, type_label, urgency_chip
 from app.core.workflow import (
@@ -29,6 +30,7 @@ from app.core.workflow import (
 
 CASE_FIELDS = {field.name for field in fields(CaseResult)}
 URGENCY_PRIORITY = {"Critical": 0, "High": 1, "Medium": 2, "Low": 3}
+MANAGER_CONFIRMABLE_STATUSES = {"Resolved", "No Action Closed"}
 
 
 def case_from_record(record: dict[str, Any]) -> CaseResult:
@@ -125,7 +127,7 @@ def select_record(records: list[dict[str, Any]], *, key: str, default_to_first: 
     event = st.dataframe(
         rows,
         hide_index=True,
-        use_container_width=True,
+        width="stretch",
         on_select="rerun",
         selection_mode="single-row",
         key=key,
@@ -180,6 +182,10 @@ def render_branch_output_summary(case: CaseResult) -> None:
             st.caption(f"Follow-up due: {case.follow_up_at}")
         if case.sla_due_at:
             st.caption(f"SLA due: {case.sla_due_at}")
+        target = team_forward_target(case)
+        if target:
+            status = display_internal_forward_status(case)
+            st.caption(f"Team forward: {status} -> {target[0]}")
     with col3:
         st.markdown("**Action plan**")
         if case.actions:
@@ -190,6 +196,12 @@ def render_branch_output_summary(case: CaseResult) -> None:
 
 
 def operator_log_line(value: str) -> str:
+    lower = value.lower()
+    if lower.startswith("outbound reply sent:"):
+        return "Outbound reply sent."
+    if lower.startswith("internal notification sent to "):
+        team_part = value.split("(", 1)[0].replace("Internal notification", "Team forward").strip()
+        return f"{team_part}."
     for old, new in {
         "LLM/classifier produced tags:": "Tags assigned:",
         "Response sent in simulation": "Response recorded",
@@ -210,7 +222,136 @@ def render_audit_timeline(case: CaseResult) -> None:
     if not rows:
         st.caption("No audit entries recorded.")
         return
-    st.dataframe(rows, hide_index=True, use_container_width=True)
+    st.dataframe(rows, hide_index=True, width="stretch")
+
+
+def requester_recipient(case: CaseResult) -> str:
+    return case.source_reply_to or case.requester or "requester"
+
+
+def original_gmail_message(case: CaseResult, record: dict[str, Any]) -> GmailMessage:
+    return GmailMessage(
+        message_id=case.source_message_id or str(record.get("source_message_id") or ""),
+        thread_id=case.source_thread_id or str(record.get("source_thread_id") or "") or None,
+        requester=case.requester,
+        subject=case.subject,
+        body=case.body,
+        reply_to=case.source_reply_to or case.requester,
+        rfc_message_id=case.source_rfc_message_id,
+        received_at=case.received_at,
+    )
+
+
+def team_forward_target(case: CaseResult) -> tuple[str, str] | None:
+    target = internal_notification_target(case)
+    if target:
+        recipient, team = target
+        return case.internal_notification_to or recipient, team
+    if case.internal_notification_to:
+        return case.internal_notification_to, "Internal team"
+    return None
+
+
+def display_internal_forward_status(case: CaseResult) -> str:
+    status = case.internal_notification_status or "not_evaluated"
+    if status == "not_evaluated":
+        return "not sent yet"
+    if status == "not_applicable":
+        return "not required"
+    return status
+
+
+def send_internal_forward(case: CaseResult, record: dict[str, Any]) -> tuple[bool, str]:
+    target = team_forward_target(case)
+    if not target:
+        return False, "No internal team route is configured for this case."
+    recipient, team = target
+    if not recipient.strip():
+        return False, f"No {team} email is configured."
+
+    message = original_gmail_message(case, record)
+    body = internal_notification_body(case, message, team)
+    validation_error = validate_gmail_send_content(recipient, body, allow_internal=True)
+    if validation_error:
+        return False, validation_error
+
+    try:
+        service = build_gmail_service()
+        sent = send_gmail_message(
+            service,
+            to=recipient,
+            subject=internal_notification_subject(case, team),
+            body=body,
+            allow_internal=True,
+        )
+        case.internal_notification_status = "sent"
+        case.internal_notification_to = recipient
+        case.internal_notification_message_id = sent.get("sent_message_id", "")
+        case.internal_notification_reason = f"Team forward sent to {team}."
+        case.internal_notification_error = ""
+        case.log.append(f"Internal notification sent to {team} ({recipient}).")
+        save_case(case, record)
+        return True, f"Team forward sent to {recipient}."
+    except Exception as exc:
+        case.internal_notification_status = "failed"
+        case.internal_notification_to = recipient
+        case.internal_notification_error = exc.__class__.__name__
+        case.internal_notification_reason = f"Team forward failed for {team}."
+        case.log.append(f"Internal notification failed: {case.internal_notification_error}")
+        save_case(case, record)
+        return False, f"Team forward failed: {case.internal_notification_error}"
+
+
+def display_outbound_reason(case: CaseResult) -> str:
+    reason = case.outbound_reason.strip()
+    if case.outbound_status == "sent" and "eligible for mailbox auto-reply" in reason.lower():
+        return "Acknowledgement was sent automatically during Gmail polling."
+    return reason
+
+
+def display_internal_forward_reason(case: CaseResult, team: str | None = None) -> str:
+    reason = case.internal_notification_reason.strip()
+    team_name = team or "team"
+    if case.internal_notification_status == "sent":
+        return f"Team forward sent to {team_name}."
+    if case.internal_notification_status == "failed":
+        return f"Team forward failed for {team_name}."
+    return reason
+
+
+def render_mail_flow(case: CaseResult, record: dict[str, Any]) -> None:
+    has_requester_mail = bool(case.customer_output.strip())
+    target = team_forward_target(case)
+    if not has_requester_mail and not target:
+        return
+
+    st.markdown("**Mail flow**")
+    if has_requester_mail:
+        label = "Acknowledgement sent to requester" if case.outbound_status == "sent" else "Acknowledgement draft"
+        st.write(f"{label}: {case.outbound_status} -> {requester_recipient(case)}")
+        outbound_reason = display_outbound_reason(case)
+        if outbound_reason:
+            st.caption(outbound_reason)
+        if case.send_error:
+            st.caption(f"Error: {case.send_error}")
+        box_label = "Acknowledgement sent to requester" if case.outbound_status == "sent" else "Acknowledgement draft for requester"
+        render_readonly_mail_box(box_label, case.customer_output, clean_text=True)
+
+    if target:
+        recipient, team = target
+        status = display_internal_forward_status(case)
+        label = "Mail forwarded to team" if case.internal_notification_status == "sent" else "Team mail"
+        st.write(f"{label}: {status} -> {recipient}")
+        internal_reason = display_internal_forward_reason(case, team)
+        if internal_reason:
+            st.caption(internal_reason)
+        if case.internal_notification_error:
+            st.caption(f"Error: {case.internal_notification_error}")
+        body = internal_notification_body(case, original_gmail_message(case, record), team)
+        box_label = "Mail forwarded to team" if case.internal_notification_status == "sent" else "Team mail content"
+        render_readonly_mail_box(box_label, body, clean_text=False)
+        if case.internal_notification_status != "sent":
+            st.caption("Team forwards are sent automatically when Gmail polling routes a case.")
 
 
 def render_case_meta_strip(case: CaseResult) -> None:
@@ -227,9 +368,45 @@ def manual_reply_status(case: CaseResult) -> str:
     return "Resolved"
 
 
+def is_resolved_without_send(case: CaseResult) -> bool:
+    if case.status != "Resolved" or case.outbound_status == "sent":
+        return False
+    reason = case.outbound_reason.lower()
+    if "resolved without sending" in reason or "without sending the assistant draft" in reason:
+        return True
+    return any("marked as resolved" in item.lower() for item in case.log)
+
+
+def manager_closed_case(case: CaseResult) -> bool:
+    if case.dashboard_hidden:
+        return True
+    manager_markers = (
+        "manager confirmed resolved",
+        "manager marked as resolved from inbox queue",
+    )
+    return any(any(marker in item.lower() for marker in manager_markers) for item in case.log)
+
+
+def is_dashboard_visible_case(case: CaseResult) -> bool:
+    return not manager_closed_case(case)
+
+
 def mark_case_resolved(case: CaseResult, record: dict[str, Any], *, reason: str = "Manager marked as resolved") -> None:
     previous_status = case.status
+    if previous_status in MANAGER_CONFIRMABLE_STATUSES:
+        case.dashboard_hidden = True
+        case.log.append(f"{reason}: manager confirmed resolved")
+        save_case(case, record)
+        return
+
+    if case.customer_output.strip() and case.outbound_status != "sent":
+        case.customer_output = ""
+        case.outbound_status = "not_sent"
+        case.outbound_reason = "Manager resolved this case without sending the assistant draft."
+        case.send_error = ""
+        case.log.append("Assistant draft discarded because the manager resolved the case without sending mail")
     case.status = "Resolved"
+    case.dashboard_hidden = True
     case.log.append(f"{reason}: status changed from {previous_status} to Resolved")
     save_case(case, record)
 
@@ -305,7 +482,7 @@ def render_reply_workspace(
     if msg_key in st.session_state:
         ok, text = st.session_state[msg_key]
         (st.success if ok else st.error)(text)
-    if st.button("Send mail", type="primary", use_container_width=True, key=f"send-{case.id}"):
+    if st.button("Send mail", type="primary", width="stretch", key=f"send-{case.id}"):
         success, text = send_operator_reply(case, record, recipient=recipient, body=body)
         if return_to_queue_on_send:
             st.session_state["review_send_result"] = {
@@ -339,6 +516,7 @@ def render_case_detail(case: CaseResult, record: dict[str, Any], *, show_summary
     render_case_meta_strip(case)
     if show_summary:
         render_branch_output_summary(case)
+    render_mail_flow(case, record)
 
     tab_email, tab_decision, tab_audit = st.tabs(["Email", "Assistant plan", "Audit"])
     with tab_email:
@@ -371,8 +549,17 @@ def render_case_detail(case: CaseResult, record: dict[str, Any], *, show_summary
         st.markdown("**Classification rationale**")
         st.write(case.classification.rationale)
         if case.internal_output.strip():
-            st.markdown("**Internal routing note**")
+            st.markdown("**Routing summary**")
             st.text(case.internal_output)
+        if case.internal_notification_status not in {"", "not_evaluated", "not_applicable"}:
+            st.markdown("**Forwarded to team**")
+            target = case.internal_notification_to or "team inbox not configured"
+            st.write(f"{case.internal_notification_status} -> {target}")
+            forward_reason = display_internal_forward_reason(case)
+            if forward_reason:
+                st.caption(forward_reason)
+            if case.internal_notification_error:
+                st.caption(f"Error: {case.internal_notification_error}")
         if case.classification.details:
             with st.expander("Extracted details", expanded=False):
                 st.json(case.classification.details)
@@ -410,6 +597,10 @@ def filtered_records(
 
 def is_auto_reply_candidate(case: CaseResult) -> bool:
     if not case.customer_output.strip():
+        return False
+    if case.outbound_status == "sent":
+        return False
+    if is_resolved_without_send(case):
         return False
     if case.status == "Needs Human" or case.auto_resolution_paused:
         return False

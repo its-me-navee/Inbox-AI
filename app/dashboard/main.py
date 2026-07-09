@@ -16,7 +16,7 @@ from app.common.gmail import credentials_configured, gmail_authorization_url, oa
 from app.common.polling import poll_gmail_once
 from app.common.settings import app_settings
 from app.common.storage import list_cases
-from app.dashboard.ui.case_views import case_from_record
+from app.dashboard.ui.case_views import case_from_record, is_dashboard_visible_case
 from app.dashboard.ui.components import render_app_hero
 from app.dashboard.ui.styles import APP_CSS
 from app.dashboard.ui.tabs import (
@@ -24,6 +24,7 @@ from app.dashboard.ui.tabs import (
     render_metrics_tab,
     render_replies_tab,
     render_review_tab,
+    render_routed_tab,
     render_setup_tab,
     render_workflow_tab,
 )
@@ -107,7 +108,9 @@ def load_case_records() -> list[dict[str, Any]]:
     valid: list[dict[str, Any]] = []
     for record in list_cases():
         try:
-            case_from_record(record)
+            case = case_from_record(record)
+            if not is_dashboard_visible_case(case):
+                continue
             valid.append(record)
         except Exception:
             continue
@@ -149,18 +152,22 @@ needs_human = sum(1 for r in records if r.get("status") == "Needs Human")
 render_app_hero(len(records), needs_human)
 render_main_poll_action()
 
-t1, t2, t3, t4, t5, t6 = st.tabs(["Inbox Queue", "Manager Review", "Assistant Replies", "Metrics", "Workflow", "Setup"])
+t1, t2, t3, t4, t5, t6, t7 = st.tabs(
+    ["Inbox Queue", "Manager Review", "Routed", "Assistant Replies", "Metrics", "Workflow", "Setup"]
+)
 with t1:
     render_inbox_tab(records)
 with t2:
     render_review_tab(records)
 with t3:
-    render_replies_tab(records)
+    render_routed_tab(records)
 with t4:
-    render_metrics_tab(records)
+    render_replies_tab(records)
 with t5:
-    render_workflow_tab()
+    render_metrics_tab(records)
 with t6:
+    render_workflow_tab()
+with t7:
     render_setup_tab()
 
 # Poll after the dashboard has already rendered so the first load isn't

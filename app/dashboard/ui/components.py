@@ -133,5 +133,5 @@ def render_remediation_table() -> None:
             {"Case": "No reply needed", "Manager decision": "No follow-up needed", "Assistant prepares": "Reason and close status"},
         ],
         hide_index=True,
-        use_container_width=True,
+        width="stretch",
     )

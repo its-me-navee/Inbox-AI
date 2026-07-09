@@ -14,6 +14,8 @@ from app.common.settings import app_settings
 from app.dashboard.ui.case_views import (
     case_from_record,
     compact_subject,
+    display_outbound_reason,
+    display_internal_forward_status,
     filtered_records,
     is_auto_reply_candidate,
     is_human_review_case,
@@ -23,6 +25,7 @@ from app.dashboard.ui.case_views import (
     render_reply_workspace,
     render_review_workspace,
     sort_records_by_urgency,
+    team_forward_target,
 )
 from app.dashboard.ui.components import (
     render_empty_state,
@@ -42,12 +45,15 @@ ROUTING_ENV_KEYS = {
     "dock_planning_email": "INBOX_AI_DOCK_PLANNING_EMAIL",
 }
 ACTIVE_REVIEW_KEY = "active_review_case_id"
+ACTIVE_ROUTED_KEY = "active_routed_case_id"
 REVIEW_SEND_RESULT_KEY = "review_send_result"
 ACTIVE_INBOX_KEY = "active_inbox_case_id"
 INBOX_RESOLVE_RESULT_KEY = "inbox_resolve_result"
 ACTIVE_REPLY_KEY = "active_reply_case_id"
+ACTIVE_SENT_REPLY_KEY = "active_sent_reply_case_id"
 FLASH_TTL_SECONDS = 3.0
-RESOLVED_STATUS = "Resolved"
+ROUTED_STATUS = "Routed"
+CONFIRM_REVIEW_STATUSES = {"Resolved", "No Action Closed"}
 
 
 def render_requester_email(column: Any, requester: str) -> None:
@@ -83,8 +89,16 @@ def close_review_dialog() -> None:
     st.session_state.pop(ACTIVE_REVIEW_KEY, None)
 
 
+def close_routed_dialog() -> None:
+    st.session_state.pop(ACTIVE_ROUTED_KEY, None)
+
+
 def close_reply_dialog() -> None:
     st.session_state.pop(ACTIVE_REPLY_KEY, None)
+
+
+def close_sent_reply_dialog() -> None:
+    st.session_state.pop(ACTIVE_SENT_REPLY_KEY, None)
 
 
 def render_inbox_case_dialog(record: dict[str, Any]) -> None:
@@ -109,13 +123,24 @@ def render_review_case_dialog(record: dict[str, Any]) -> None:
     _dialog()
 
 
+def render_routed_case_dialog(record: dict[str, Any]) -> None:
+    @st.dialog("Routed case", width="large", on_dismiss=close_routed_dialog)
+    def _dialog() -> None:
+        case = case_from_record(record)
+        st.markdown(f"### {compact_subject(case.subject, 90)}")
+        st.divider()
+        render_case_detail(case, record, show_title=False)
+
+    _dialog()
+
+
 def render_reply_case_dialog(record: dict[str, Any]) -> None:
     @st.dialog("Assistant reply", width="large", on_dismiss=close_reply_dialog)
     def _dialog() -> None:
         case = case_from_record(record)
         st.markdown(f"### {compact_subject(case.subject, 90)}")
         render_branch_output_summary(case)
-        st.caption(case.outbound_reason or "Eligible for mailbox auto-reply when policy allows.")
+        st.caption(display_outbound_reason(case) or "Acknowledgement is ready for review.")
         st.divider()
         render_case_detail(case, record, show_summary=False, show_title=False)
         st.divider()
@@ -125,24 +150,37 @@ def render_reply_case_dialog(record: dict[str, Any]) -> None:
     _dialog()
 
 
+def render_sent_reply_case_dialog(record: dict[str, Any]) -> None:
+    @st.dialog("Sent acknowledgement", width="large", on_dismiss=close_sent_reply_dialog)
+    def _dialog() -> None:
+        case = case_from_record(record)
+        st.markdown(f"### {compact_subject(case.subject, 90)}")
+        render_branch_output_summary(case)
+        st.caption(display_outbound_reason(case) or "Acknowledgement was sent.")
+        st.divider()
+        render_case_detail(case, record, show_summary=False, show_title=False)
+
+    _dialog()
+
+
 def inbox_table_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    return [record for record in records if record.get("status") != RESOLVED_STATUS]
+    return records
 
 
 def render_inbox_tab(records: list[dict[str, Any]]) -> None:
     render_metrics_row(records)
     st.divider()
-    active_records = inbox_table_records(records)
+    inbox_records = inbox_table_records(records)
     fc = st.columns([0.25, 0.25, 0.4, 0.1])
-    statuses = sorted({str(r.get("status")) for r in active_records if r.get("status")})
-    types = sorted({str((r.get("classification") or {}).get("request_type")) for r in active_records if (r.get("classification") or {}).get("request_type")})
+    statuses = sorted({str(r.get("status")) for r in inbox_records if r.get("status")})
+    types = sorted({str((r.get("classification") or {}).get("request_type")) for r in inbox_records if (r.get("classification") or {}).get("request_type")})
     sel_status = fc[0].multiselect("Status", statuses, placeholder="All", format_func=status_label)
     sel_type = fc[1].multiselect("Type", types, placeholder="All", format_func=type_label)
     search = fc[2].text_input("Search", placeholder="Subject, requester, body…")
-    if fc[3].button("Refresh", use_container_width=True):
+    if fc[3].button("Refresh", width="stretch"):
         st.rerun()
 
-    visible = filtered_records(active_records, statuses=sel_status, request_types=sel_type, search=search)
+    visible = filtered_records(inbox_records, statuses=sel_status, request_types=sel_type, search=search)
     if not records:
         render_empty_state("No cases yet", "Sync Gmail to let the assistant classify incoming requests.")
         return
@@ -152,10 +190,9 @@ def render_inbox_tab(records: list[dict[str, Any]]) -> None:
         st.success(resolve_result)
         clear_flash_after_delay(INBOX_RESOLVE_RESULT_KEY)
 
-    resolved_count = len(records) - len(active_records)
-    st.caption(f"{len(visible)} of {len(active_records)} active cases. {resolved_count} marked as resolved counted above.")
-    if not active_records:
-        render_empty_state("Inbox queue clear", "Marked-as-resolved cases are counted in the dashboard metrics.")
+    st.caption(f"{len(visible)} of {len(inbox_records)} inbox cases. Manager-confirmed cases leave this dashboard.")
+    if not inbox_records:
+        render_empty_state("Inbox queue clear", "Synced mailbox cases appear here.")
     elif not visible:
         st.caption("No cases match the current filters.")
     else:
@@ -163,7 +200,7 @@ def render_inbox_tab(records: list[dict[str, Any]]) -> None:
 
     active_case_id = st.session_state.get(ACTIVE_INBOX_KEY)
     if active_case_id:
-        active_record = next((record for record in active_records if record.get("id") == active_case_id), None)
+        active_record = next((record for record in inbox_records if record.get("id") == active_case_id), None)
         if active_record:
             render_inbox_case_dialog(active_record)
         else:
@@ -181,23 +218,29 @@ def render_inbox_queue(records: list[dict[str, Any]]) -> None:
     header[6].markdown("**Status**")
 
     for record in sort_records_by_urgency(records):
-        if record.get("status") == RESOLVED_STATUS:
-            continue
         case = case_from_record(record)
         cols = st.columns([0.09, 0.18, 0.12, 0.12, 0.29, 0.12, 0.08])
-        if cols[0].button("Open", key=f"inbox-open-{case.id}", use_container_width=True):
+        if cols[0].button("Open", key=f"inbox-open-{case.id}", width="stretch"):
             st.session_state[ACTIVE_INBOX_KEY] = case.id
             st.rerun()
-        if cols[1].button("Mark as resolved", key=f"inbox-resolve-{case.id}", use_container_width=True):
-            mark_case_resolved(case, record, reason="Manager marked as resolved from Inbox Queue")
+        button_label = inbox_resolution_action_label(case.status)
+        confirming_review = button_label == "Confirm reviewed"
+        if cols[1].button(button_label, key=f"inbox-resolve-{case.id}", width="stretch"):
+            reason = "Manager confirmed review from Inbox Queue" if confirming_review else "Manager marked as resolved from Inbox Queue"
+            mark_case_resolved(case, record, reason=reason)
             close_inbox_dialog()
-            set_flash(INBOX_RESOLVE_RESULT_KEY, "Marked as resolved.")
+            message = "Review confirmed. Mail history was kept." if confirming_review else "Marked as resolved. No mail was sent."
+            set_flash(INBOX_RESOLVE_RESULT_KEY, message)
             st.rerun()
         cols[2].write(case.classification.urgency)
         cols[3].write(type_label(case.classification.request_type))
         cols[4].write(compact_subject(case.subject, 78))
         render_requester_email(cols[5], case.requester)
         cols[6].write(status_label(case.status))
+
+
+def inbox_resolution_action_label(status: str) -> str:
+    return "Confirm reviewed" if status in CONFIRM_REVIEW_STATUSES else "Mark as resolved"
 
 
 def render_review_tab(records: list[dict[str, Any]]) -> None:
@@ -255,7 +298,7 @@ def render_review_queue(records: list[dict[str, Any]]) -> None:
     for record in sort_records_by_urgency(records):
         case = case_from_record(record)
         cols = st.columns([0.12, 0.12, 0.16, 0.14, 0.32, 0.14])
-        if cols[0].button("Let's review", key=f"review-open-{case.id}", use_container_width=True):
+        if cols[0].button("Let's review", key=f"review-open-{case.id}", width="stretch"):
             st.session_state[ACTIVE_REVIEW_KEY] = case.id
             st.rerun()
         cols[1].write(case.classification.urgency)
@@ -265,27 +308,120 @@ def render_review_queue(records: list[dict[str, Any]]) -> None:
         render_requester_email(cols[5], case.requester)
 
 
+def render_routed_tab(records: list[dict[str, Any]]) -> None:
+    routed = [record for record in records if record.get("status") == ROUTED_STATUS]
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Routed", len(routed))
+    c2.metric("Team forward sent", sum(1 for r in routed if case_from_record(r).internal_notification_status == "sent"))
+    c3.metric("Needs team forward", sum(1 for r in routed if case_from_record(r).internal_notification_status != "sent"))
+    c4.metric("SLA tracked", sum(1 for r in routed if case_from_record(r).sla_due_at))
+    st.divider()
+
+    if not routed:
+        render_empty_state("No routed cases", "Service requests routed to operations teams appear here.")
+        return
+
+    fc = st.columns([0.42, 0.18, 0.18, 0.12])
+    search = fc[0].text_input("Search routed", placeholder="Subject, requester, body…")
+    forward_filter = fc[1].selectbox("Team forward", ["All", "Sent", "Needs send"], key="routed-forward-filter")
+    sla_filter = fc[2].selectbox("SLA", ["All", "With SLA", "Missing SLA"], key="routed-sla-filter")
+    if fc[3].button("Refresh", width="stretch", key="routed-refresh"):
+        st.rerun()
+
+    visible = filtered_records(routed, statuses=[], request_types=[], search=search)
+    if forward_filter == "Sent":
+        visible = [r for r in visible if case_from_record(r).internal_notification_status == "sent"]
+    elif forward_filter == "Needs send":
+        visible = [r for r in visible if case_from_record(r).internal_notification_status != "sent"]
+    if sla_filter == "With SLA":
+        visible = [r for r in visible if case_from_record(r).sla_due_at]
+    elif sla_filter == "Missing SLA":
+        visible = [r for r in visible if not case_from_record(r).sla_due_at]
+
+    if not visible:
+        st.caption("No routed cases match the current filters.")
+    else:
+        render_routed_queue(visible)
+
+    active_case_id = st.session_state.get(ACTIVE_ROUTED_KEY)
+    if active_case_id:
+        selected = next((record for record in routed if record.get("id") == active_case_id), None)
+        if selected:
+            render_routed_case_dialog(selected)
+        else:
+            close_routed_dialog()
+
+
+def render_routed_queue(records: list[dict[str, Any]]) -> None:
+    st.caption(f"{len(records)} routed case(s). Open one to monitor SLA and team-forward delivery.")
+    header = st.columns([0.09, 0.14, 0.16, 0.16, 0.30, 0.15])
+    header[0].markdown("**Open**")
+    header[1].markdown("**SLA due**")
+    header[2].markdown("**Team**")
+    header[3].markdown("**Forward**")
+    header[4].markdown("**Subject**")
+    header[5].markdown("**Requester**")
+
+    for record in sort_records_by_urgency(records):
+        case = case_from_record(record)
+        target = team_forward_target(case)
+        team_label = target[1] if target else "-"
+        cols = st.columns([0.09, 0.14, 0.16, 0.16, 0.30, 0.15])
+        if cols[0].button("Open", key=f"routed-open-{case.id}", width="stretch"):
+            st.session_state[ACTIVE_ROUTED_KEY] = case.id
+            st.rerun()
+        cols[1].write(case.sla_due_at or "-")
+        cols[2].write(team_label)
+        cols[3].write(display_internal_forward_status(case))
+        cols[4].write(compact_subject(case.subject, 70))
+        render_requester_email(cols[5], case.requester)
+
+
+def is_sent_reply_record(record: dict[str, Any]) -> bool:
+    case = case_from_record(record)
+    return bool(case.customer_output.strip()) and case.outbound_status == "sent"
+
+
+def is_held_reply_record(record: dict[str, Any]) -> bool:
+    case = case_from_record(record)
+    return bool(case.customer_output.strip()) and case.outbound_status == "not_sent" and not is_auto_reply_candidate(case)
+
+
 def render_replies_tab(records: list[dict[str, Any]]) -> None:
     candidates = [r for r in records if is_auto_reply_candidate(case_from_record(r))]
+    sent_records = [r for r in records if is_sent_reply_record(r)]
+    held_records = [r for r in records if is_held_reply_record(r)]
     active_case_id = st.session_state.get(ACTIVE_REPLY_KEY)
     active_record = next((record for record in records if record.get("id") == active_case_id), None)
+    if active_record and not is_auto_reply_candidate(case_from_record(active_record)):
+        active_record = None
     if active_case_id and not active_record:
         close_reply_dialog()
+    active_sent_id = st.session_state.get(ACTIVE_SENT_REPLY_KEY)
+    active_sent_record = next((record for record in sent_records if record.get("id") == active_sent_id), None)
+    if active_sent_id and not active_sent_record:
+        close_sent_reply_dialog()
 
     c1, c2, c3 = st.columns(3)
     c1.metric("Ready replies", len(candidates))
-    c2.metric("Sent", sum(1 for r in candidates if r.get("outbound_status") == "sent"))
-    c3.metric("Held", sum(1 for r in candidates if r.get("outbound_status") == "not_sent"))
-    st.caption("Assistant replies prepared for safe outbound handling when mail sending is enabled.")
+    c2.metric("Sent", len(sent_records))
+    c3.metric("Held", len(held_records))
+    st.caption("Assistant acknowledgements prepared, sent, or held for safe outbound handling.")
     st.divider()
-    if not candidates and not active_record:
+    if not candidates and not sent_records and not active_record and not active_sent_record:
         render_empty_state("No assistant replies", "Resolved enquiries and routed service requests with generated replies appear here.")
         return
 
     if candidates:
+        st.markdown("#### Ready to send")
         render_replies_queue(candidates)
+    if sent_records:
+        st.markdown("#### Sent acknowledgements")
+        render_sent_replies_queue(sent_records)
     if active_record:
         render_reply_case_dialog(active_record)
+    if active_sent_record:
+        render_sent_reply_case_dialog(active_sent_record)
 
 
 def render_replies_queue(records: list[dict[str, Any]]) -> None:
@@ -301,7 +437,7 @@ def render_replies_queue(records: list[dict[str, Any]]) -> None:
     for record in sort_records_by_urgency(records):
         case = case_from_record(record)
         cols = st.columns([0.09, 0.12, 0.16, 0.34, 0.17, 0.12])
-        if cols[0].button("Open", key=f"reply-open-{case.id}", use_container_width=True):
+        if cols[0].button("Open", key=f"reply-open-{case.id}", width="stretch"):
             st.session_state[ACTIVE_REPLY_KEY] = case.id
             st.rerun()
         cols[1].write(case.classification.urgency)
@@ -309,6 +445,38 @@ def render_replies_queue(records: list[dict[str, Any]]) -> None:
         cols[3].write(compact_subject(case.subject, 78))
         render_requester_email(cols[4], case.requester)
         cols[5].write(status_label(case.status))
+
+
+def render_sent_replies_queue(records: list[dict[str, Any]]) -> None:
+    st.caption(f"{len(records)} sent acknowledgement{'s' if len(records) != 1 else ''}. Open one to verify the sent mail history.")
+    header = st.columns([0.09, 0.12, 0.16, 0.34, 0.17, 0.12])
+    header[0].markdown("**Open**")
+    header[1].markdown("**Urgency**")
+    header[2].markdown("**Type**")
+    header[3].markdown("**Subject**")
+    header[4].markdown("**Requester**")
+    header[5].markdown("**Mail**")
+
+    for record in sort_records_by_urgency(records):
+        case = case_from_record(record)
+        cols = st.columns([0.09, 0.12, 0.16, 0.34, 0.17, 0.12])
+        if cols[0].button("Open", key=f"sent-reply-open-{case.id}", width="stretch"):
+            st.session_state[ACTIVE_SENT_REPLY_KEY] = case.id
+            st.rerun()
+        cols[1].write(case.classification.urgency)
+        cols[2].write(type_label(case.classification.request_type))
+        cols[3].write(compact_subject(case.subject, 78))
+        render_requester_email(cols[4], case.requester)
+        cols[5].write("Sent")
+
+
+def render_count_table(title: str, counts: dict[str, int]) -> None:
+    st.markdown(f"##### {title}")
+    rows = [{"Label": key, "Cases": value} for key, value in sorted(counts.items()) if value > 0]
+    if rows:
+        st.dataframe(rows, hide_index=True, width="stretch")
+    else:
+        st.caption("No data yet.")
 
 
 def render_metrics_tab(records: list[dict[str, Any]]) -> None:
@@ -326,17 +494,13 @@ def render_metrics_tab(records: list[dict[str, Any]]) -> None:
         by_urgency[case.classification.urgency] = by_urgency.get(case.classification.urgency, 0) + 1
     cl, cr = st.columns(2)
     with cl:
-        st.markdown("##### Volume by request type")
-        if by_type:
-            st.bar_chart(by_type, use_container_width=True)
+        render_count_table("Volume by request type", by_type)
     with cr:
-        st.markdown("##### Volume by status")
-        if by_status:
-            st.bar_chart(by_status, use_container_width=True)
+        render_count_table("Volume by status", by_status)
     st.dataframe(
         [{"Urgency": key, "Cases": value} for key, value in sorted(by_urgency.items())],
         hide_index=True,
-        use_container_width=True,
+        width="stretch",
     )
 
 def render_workflow_tab() -> None:
@@ -359,8 +523,8 @@ def render_setup_tab() -> None:
         ops_lead_email = st.text_input("Operations lead inbox", value=settings.ops_lead_email)
         dock_planning_email = st.text_input("Dock planning inbox", value=settings.dock_planning_email)
         c1, c2 = st.columns([0.5, 0.5])
-        save = c1.form_submit_button("Save setup", use_container_width=True, type="primary")
-        reset = c2.form_submit_button("Reset session setup", use_container_width=True)
+        save = c1.form_submit_button("Save setup", width="stretch", type="primary")
+        reset = c2.form_submit_button("Reset session setup", width="stretch")
 
     if reset:
         for key in ROUTING_ENV_KEYS.values():

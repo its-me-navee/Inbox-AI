@@ -57,6 +57,11 @@ class CaseResult:
     sent_at: str = ""
     sent_message_id: str = ""
     send_error: str = ""
+    internal_notification_status: str = "not_evaluated"
+    internal_notification_reason: str = ""
+    internal_notification_to: str = ""
+    internal_notification_message_id: str = ""
+    internal_notification_error: str = ""
     source_message_id: str = ""
     source_thread_id: str = ""
     source_rfc_message_id: str = ""
@@ -65,6 +70,7 @@ class CaseResult:
     attachment_count: int = 0
     attachment_names: list[str] = field(default_factory=list)
     attachment_mime_types: list[str] = field(default_factory=list)
+    dashboard_hidden: bool = False
     agent_trace: list[AgentTrace] = field(default_factory=list)
     log: list[str] = field(default_factory=list)
 

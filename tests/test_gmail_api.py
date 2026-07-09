@@ -8,10 +8,12 @@ from fastapi.testclient import TestClient
 
 import app.common.polling as polling
 import app.dashboard.ui.case_views as case_views
+import app.dashboard.ui.tabs as tabs
 from app.main import app
 from app.common.gmail import (
     GmailAttachment,
     GmailMessage,
+    build_raw_message,
     build_reply_raw_message,
     clean_email_body,
     list_recent_message_ids,
@@ -19,7 +21,7 @@ from app.common.gmail import (
     send_gmail_reply,
 )
 from app.common.storage import CaseRepository, append_case, case_exists, list_cases, list_poll_errors, update_case
-from app.core.workflow import CaseResult, Classification
+from app.core.workflow import Action, CaseResult, Classification
 
 
 def encoded(value: str) -> str:
@@ -284,6 +286,44 @@ def eligible_general_case() -> CaseResult:
     )
 
 
+def eligible_service_case() -> CaseResult:
+    case = eligible_general_case()
+    case.classification.request_type = "Service Request"
+    case.classification.urgency = "Medium"
+    case.classification.rationale = "Inbound appointment reschedule request routed to dock planning."
+    case.classification.tags = ["service_request", "appointment"]
+    case.classification.details = {
+        "requested_action": "reschedule inbound appointment",
+        "appointment_id": "FC-BLR8-7781",
+        "asn": "FBA99887",
+        "po": "45001234",
+        "requested_date": "July 11, 2026",
+        "requested_time": "10:00 AM to 12:00 PM",
+    }
+    case.status = "Routed"
+    case.summary = "Requester asked to reschedule an inbound appointment."
+    case.customer_output = (
+        "Dear Navee,\n\n"
+        "We have received your request to reschedule the inbound appointment. "
+        "Our dock planning team will review the details and follow up if additional information is required.\n\n"
+        "Regards,\nWarehouse Operations"
+    )
+    case.internal_output = (
+        "Internal routing note\n"
+        "Requester: driver.dispatch@example.com\n"
+        "Route to dock planning for appointment reschedule review."
+    )
+    case.actions = [
+        Action(
+            "Route to relevant department",
+            "Dock planning should review the requested appointment change.",
+            "dock@example.com",
+        )
+    ]
+    case.sub_topic = ""
+    return case
+
+
 def test_build_reply_raw_message_preserves_thread_headers() -> None:
     original = GmailMessage(
         message_id="msg-1",
@@ -317,6 +357,21 @@ def test_send_safety_blocks_internal_text() -> None:
 
     with pytest.raises(ValueError, match="internal routing text"):
         build_reply_raw_message(original, "Internal routing note\nRequester: driver@example.com")
+
+
+def test_build_raw_message_allows_internal_text_when_explicit() -> None:
+    raw = build_raw_message(
+        to="dock@example.com",
+        subject="Inbox AI routed Service Request",
+        body="Internal routing note\nRequester: driver@example.com\nRoute to dock planning.",
+        allow_internal=True,
+    )
+    parsed = message_from_bytes(base64.urlsafe_b64decode(raw + "=" * (-len(raw) % 4)))
+
+    assert parsed["To"] == "dock@example.com"
+    assert parsed["Subject"] == "Inbox AI routed Service Request"
+    assert "Internal routing note" in parsed.get_payload()
+    assert "Requester: driver@example.com" in parsed.get_payload()
 
 
 def test_send_gmail_reply_uses_original_thread(monkeypatch) -> None:
@@ -438,6 +493,92 @@ def test_poll_gmail_once_sends_eligible_case(tmp_path, monkeypatch) -> None:
     assert cases[0]["sent_message_id"] == "sent-1"
 
 
+def test_poll_gmail_once_forwards_service_request_to_internal_team(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("INBOX_AI_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("AUTO_SEND_ENABLED", "true")
+    monkeypatch.setenv("INBOX_AI_DOCK_PLANNING_EMAIL", "dock@example.com")
+    monkeypatch.setattr(polling, "credentials_configured", lambda: True)
+    monkeypatch.setattr(polling, "build_gmail_service", lambda: object())
+    monkeypatch.setattr(polling, "list_recent_message_ids", lambda service, max_results, query: ["msg-1"])
+    monkeypatch.setattr(
+        polling,
+        "fetch_message",
+        lambda service, message_id: GmailMessage(
+            message_id=message_id,
+            thread_id="thread-1",
+            requester="vendor@example.com",
+            subject="Reschedule appointment FC-BLR8-7781",
+            body="Please reschedule appointment FC-BLR8-7781 for ASN FBA99887.",
+            reply_to="vendor.reply@example.com",
+            received_at="2026-07-09 08:00 UTC",
+        ),
+    )
+
+    def fake_process_request(requester: str, subject: str, body: str) -> CaseResult:
+        case = eligible_service_case()
+        case.requester = requester
+        case.subject = subject
+        case.body = body
+        case.internal_output = (
+            "Internal routing note\n"
+            f"Requester: {requester}\n"
+            "Route to dock planning for appointment reschedule review."
+        )
+        return case
+
+    monkeypatch.setattr(polling, "process_request", fake_process_request)
+    replied: dict[str, object] = {}
+    monkeypatch.setattr(
+        polling,
+        "send_gmail_reply",
+        lambda service, message, response_body: replied.update({"message": message, "body": response_body})
+        or {"sent_message_id": "reply-1", "thread_id": "thread-1"},
+    )
+    forwarded: dict[str, object] = {}
+
+    def fake_send_gmail_message(
+        service: object,
+        *,
+        to: str,
+        subject: str,
+        body: str,
+        sender: str | None = None,
+        allow_internal: bool = False,
+    ) -> dict[str, str]:
+        forwarded.update({"to": to, "subject": subject, "body": body, "allow_internal": allow_internal})
+        return {"sent_message_id": "internal-1", "thread_id": ""}
+
+    monkeypatch.setattr(polling, "send_gmail_message", fake_send_gmail_message)
+
+    result = polling.poll_gmail_once(max_results=10)
+    stored = list_cases()[0]
+
+    assert result["sent"] == 1
+    assert result["not_sent"] == 0
+    assert result["internal_sent"] == 1
+    assert stored["outbound_status"] == "sent"
+    assert stored["sent_message_id"] == "reply-1"
+    assert stored["internal_notification_status"] == "sent"
+    assert stored["internal_notification_to"] == "dock@example.com"
+    assert stored["internal_notification_message_id"] == "internal-1"
+    assert isinstance(replied["message"], GmailMessage)
+    assert "dock planning team will review" in str(replied["body"])
+    assert forwarded["to"] == "dock@example.com"
+    assert forwarded["allow_internal"] is True
+    assert str(forwarded["subject"]) == "Fwd: Reschedule appointment FC-BLR8-7781"
+    assert "Hi Dock planning team," in str(forwarded["body"])
+    assert "Please look into this matter." in str(forwarded["body"])
+    assert "---------- Forwarded message ---------" in str(forwarded["body"])
+    assert "From: vendor@example.com" in str(forwarded["body"])
+    assert "Subject: Reschedule appointment FC-BLR8-7781" in str(forwarded["body"])
+    assert "Please reschedule appointment FC-BLR8-7781 for ASN FBA99887." in str(forwarded["body"])
+    assert "What the mail is saying" not in str(forwarded["body"])
+    assert "Requester confirmation" not in str(forwarded["body"])
+    assert "SLA due" not in str(forwarded["body"])
+    assert "Case reference" not in str(forwarded["body"])
+    assert "Internal routing note" not in str(forwarded["body"])
+
+
 def test_poll_gmail_once_records_processing_errors(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("INBOX_AI_DATA_DIR", str(tmp_path))
     monkeypatch.setattr(polling, "credentials_configured", lambda: True)
@@ -487,6 +628,153 @@ def test_update_case_persists_manual_outbound_status(tmp_path, monkeypatch) -> N
     assert stored["outbound_status"] == "sent"
     assert stored["outbound_reason"] == "Sent manually by operator to navee4501@gmail.com."
     assert stored["sent_message_id"] == "manual-sent-1"
+
+
+def test_mark_resolved_without_send_discards_unsent_draft(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("INBOX_AI_DATA_DIR", str(tmp_path))
+    case = eligible_general_case()
+    case.status = "Needs Human"
+    case.outbound_status = "not_sent"
+    record = append_case(case, source="gmail", source_message_id="msg-1")
+
+    case_views.mark_case_resolved(case, record, reason="Manager marked as resolved from Inbox Queue")
+
+    stored = list_cases()[0]
+    resolved = case_views.case_from_record(stored)
+    assert stored["status"] == "Resolved"
+    assert stored["customer_output"] == ""
+    assert stored["outbound_status"] == "not_sent"
+    assert stored["dashboard_hidden"] is True
+    assert "without sending the assistant draft" in stored["outbound_reason"]
+    assert any("draft discarded" in item.lower() for item in stored["log"])
+    assert case_views.is_resolved_without_send(resolved) is True
+    assert case_views.is_auto_reply_candidate(resolved) is False
+    assert case_views.is_dashboard_visible_case(resolved) is False
+
+
+def test_mark_resolved_confirms_already_resolved_case_without_clearing_output(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("INBOX_AI_DATA_DIR", str(tmp_path))
+    case = eligible_general_case()
+    case.status = "Resolved"
+    case.outbound_status = "not_sent"
+    record = append_case(case, source="gmail", source_message_id="msg-resolved")
+
+    case_views.mark_case_resolved(case, record, reason="Manager marked as resolved from Inbox Queue")
+
+    stored = list_cases()[0]
+    assert stored["status"] == "Resolved"
+    assert stored["customer_output"] == "Hello,\n\nInbound dock hours are Monday to Saturday.\n\nRegards,\nWarehouse Operations"
+    assert stored["outbound_status"] == "not_sent"
+    assert stored["dashboard_hidden"] is True
+    assert "without sending the assistant draft" not in stored["outbound_reason"]
+    assert any("manager confirmed resolved" in item.lower() for item in stored["log"])
+
+
+def test_mark_resolved_confirms_no_action_closed_case_without_status_change(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("INBOX_AI_DATA_DIR", str(tmp_path))
+    case = eligible_general_case()
+    case.classification.request_type = "No Action"
+    case.status = "No Action Closed"
+    case.customer_output = ""
+    record = append_case(case, source="gmail", source_message_id="msg-no-action")
+
+    case_views.mark_case_resolved(case, record, reason="Manager marked as resolved from Inbox Queue")
+
+    stored = list_cases()[0]
+    assert stored["status"] == "No Action Closed"
+    assert stored["customer_output"] == ""
+    assert stored["dashboard_hidden"] is True
+    assert any("manager confirmed resolved" in item.lower() for item in stored["log"])
+
+
+def test_old_marked_resolved_case_is_not_reply_candidate() -> None:
+    case = eligible_general_case()
+    case.status = "Resolved"
+    case.outbound_status = "not_sent"
+    case.log.append("Manager marked as resolved from Inbox Queue: status changed from Routed to Resolved")
+
+    assert case.customer_output
+    assert case_views.is_resolved_without_send(case) is True
+    assert case_views.is_auto_reply_candidate(case) is False
+    assert case_views.is_dashboard_visible_case(case) is False
+
+
+def test_routed_service_request_is_requester_reply_candidate() -> None:
+    case = eligible_service_case()
+
+    assert case.status == "Routed"
+    assert case_views.is_auto_reply_candidate(case) is True
+
+
+def test_sent_case_is_not_requester_reply_candidate() -> None:
+    case = eligible_service_case()
+    case.outbound_status = "sent"
+    case.sent_message_id = "reply-1"
+
+    assert case_views.is_auto_reply_candidate(case) is False
+
+
+def test_sent_acknowledgement_is_reply_history_not_sendable_candidate(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("INBOX_AI_DATA_DIR", str(tmp_path))
+    case = eligible_service_case()
+    case.outbound_status = "sent"
+    case.outbound_reason = "Eligible for mailbox auto-reply."
+    record = append_case(case, source="gmail", source_message_id="msg-sent-service")
+
+    assert case_views.is_auto_reply_candidate(case_views.case_from_record(record)) is False
+    assert tabs.is_sent_reply_record(record) is True
+    assert tabs.is_held_reply_record(record) is False
+
+
+def test_display_outbound_reason_describes_auto_sent_acknowledgement() -> None:
+    case = eligible_service_case()
+    case.outbound_status = "sent"
+    case.outbound_reason = "Eligible for mailbox auto-reply."
+
+    assert case_views.display_outbound_reason(case) == "Acknowledgement was sent automatically during Gmail polling."
+
+
+def test_send_internal_forward_updates_stored_case(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("INBOX_AI_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("INBOX_AI_DOCK_PLANNING_EMAIL", "dock@example.com")
+    case = eligible_service_case()
+    case.requester = "vendor@example.com"
+    case.subject = "Reschedule appointment FC-BLR8-7781"
+    case.body = "Please reschedule appointment FC-BLR8-7781 for ASN FBA99887."
+    record = append_case(case, source="gmail", source_message_id="msg-service-forward")
+
+    monkeypatch.setattr(case_views, "build_gmail_service", lambda: object())
+    sent_payload: dict[str, object] = {}
+
+    def fake_send_gmail_message(
+        service: object,
+        *,
+        to: str,
+        subject: str,
+        body: str,
+        sender: str | None = None,
+        allow_internal: bool = False,
+    ) -> dict[str, str]:
+        sent_payload.update({"to": to, "subject": subject, "body": body, "allow_internal": allow_internal})
+        return {"sent_message_id": "internal-1", "thread_id": ""}
+
+    monkeypatch.setattr(case_views, "send_gmail_message", fake_send_gmail_message)
+
+    success, message = case_views.send_internal_forward(case, record)
+    stored = list_cases()[0]
+
+    assert success is True
+    assert message == "Team forward sent to dock@example.com."
+    assert stored["internal_notification_status"] == "sent"
+    assert stored["internal_notification_to"] == "dock@example.com"
+    assert stored["internal_notification_message_id"] == "internal-1"
+    assert sent_payload["to"] == "dock@example.com"
+    assert sent_payload["allow_internal"] is True
+    assert "---------- Forwarded message ---------" in str(sent_payload["body"])
+    assert "Please look into this matter" in str(sent_payload["body"])
+    assert "Requester confirmation" not in str(sent_payload["body"])
+    assert "Case reference" not in str(sent_payload["body"])
+    assert "Internal routing note" not in str(sent_payload["body"])
 
 
 def test_case_repository_wrapper_matches_module_api(tmp_path, monkeypatch) -> None:

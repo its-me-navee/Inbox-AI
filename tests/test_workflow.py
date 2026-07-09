@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
+from app.core.workflow import branch_nodes
 from app.core.workflow import (
     Action,
     CaseResult,
@@ -241,7 +244,9 @@ def test_contact_request_without_kb_evidence_routes_to_human() -> None:
     assert "Carrier Check-In Requirements" not in case.summary
 
 
-def test_warehouse_service_request_routes_to_dock_planning() -> None:
+def test_warehouse_service_request_routes_to_dock_planning(monkeypatch) -> None:
+    monkeypatch.setattr(branch_nodes, "utc_now", lambda: datetime(2026, 7, 9, 10, 0, tzinfo=timezone.utc))
+
     case = process_request(
         "vendor.appointments@example.com",
         "Reschedule inbound appointment FC-BLR8-7781",
@@ -255,7 +260,8 @@ def test_warehouse_service_request_routes_to_dock_planning() -> None:
     assert case.internal_output
     assert "FC-BLR8-7781" in case.internal_output
     assert "FBA99887" in case.internal_output
-    assert case.sla_due_at
+    assert case.sla_due_at == "2026-07-09 12:00 UTC"
+    assert any(action.detail == "Set 2-hour SLA timer." for action in case.actions)
     assert any(action.owner == "navee4501@gmail.com" for action in case.actions)
     assert [action.step for action in case.actions] == [
         "Extract required details",

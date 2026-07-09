@@ -265,7 +265,7 @@ def general_enquiry_node(state: GraphState) -> GraphState:
 def service_request_node(state: GraphState) -> GraphState:
     settings = app_settings()
     now = utc_now()
-    sla = now + timedelta(hours=24)
+    sla = now + timedelta(hours=2)
     requester = state.get("requester", "")
     subject = state.get("subject", "")
     body = state.get("body", "")
@@ -312,7 +312,7 @@ def service_request_node(state: GraphState) -> GraphState:
             action("Extract required details", f"Requested action: {details.requested_action or 'warehouse service request'}."),
             action("Route to relevant department", "Route to dock planning or warehouse operations.", settings.dock_planning_email),
             action("Generate confirmation to requester", "Create confirmation for carrier/vendor requester."),
-            action("Set SLA timer", "Set 24-hour SLA timer."),
+            action("Set SLA timer", "Set 2-hour SLA timer."),
         ],
         customer_output=confirmation,
         internal_output=routing_note,

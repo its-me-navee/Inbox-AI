@@ -17,3 +17,5 @@ client_secret_2_277422588635-3jmtk221vj6nbkkbklde9m4eug3v18m7.apps.googleusercon
 oauth_client*.json
 gmail_token.json
 token.json
+*.pem
+host.md
