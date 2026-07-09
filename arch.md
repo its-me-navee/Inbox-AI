@@ -176,18 +176,18 @@ flowchart LR
 ```mermaid
 flowchart TD
     start([START])
-    mailReader["mail_reader<br/>Mail Reader Agent"]
-    classifier["classifier<br/>Classification Agent"]
-    classificationAuditor{"classification_auditor<br/>Classification Auditor Agent"}
+    mailReader["mail_reader<br/>Read message"]
+    classifier["classifier<br/>Classify intent"]
+    classificationAuditor{"classification_auditor<br/>Audit route"}
 
-    complaint["complaint<br/>Complaint Gate<br/>Complaint Agent"]
-    generalEnquiry["general_enquiry<br/>General Enquiry Gate<br/>General Enquiry Agent<br/>KB Response Agent"]
-    serviceRequest["service_request<br/>Service Request Gate<br/>Service Request Agent"]
-    escalation["escalation<br/>Escalation Gate<br/>Escalation Agent"]
-    noAction["no_action<br/>No Action Gate<br/>No Action Agent"]
-    unknown["unknown<br/>Human Review Agent<br/>Assistant Draft Agent"]
+    complaint["complaint<br/>Acknowledge and escalate"]
+    generalEnquiry["general_enquiry<br/>KB answer or review"]
+    serviceRequest["service_request<br/>Extract, route, SLA"]
+    escalation["escalation<br/>Pause and notify"]
+    noAction["no_action<br/>Suppress and close"]
+    unknown["unknown<br/>Human review draft"]
 
-    caseAuditor{"case_auditor<br/>Case Auditor Agent"}
+    caseAuditor{"case_auditor<br/>Validate output"}
     finish([END])
 
     start --> mailReader

@@ -1,166 +1,71 @@
 # Inbox AI
 
-Inbox AI is a warehouse mailbox assistant. It reads incoming Gmail messages, classifies the request, routes it through a LangGraph agent workflow, and shows the result in a Streamlit dashboard.
+Inbox AI is a warehouse mailbox assistant that reads Gmail messages, classifies the requester intent, routes each case through a LangGraph workflow, and records the result for operator review in Streamlit. The goal is safe mailbox triage: automate low-risk replies and routing, but hold complaints, escalations, unclear cases, and weakly evidenced answers for humans.
 
-The demo is designed to show how an operations mailbox can move from manual email triage to an AI-assisted queue with clear routing, audit trail, and safe reply handling.
-
-## Demo
-
-Hosted demo:
+## Workflow Design
 
 ```text
-https://inboxai.devcrew.dev/
-```
-
-To test it, send a warehouse-style email to:
-
-```text
-navnee4501@gmail.com
-```
-
-The assistant will poll the inbox, classify the email, decide the correct workflow path, and log the result in the dashboard.
-
-## What It Does
-
-- Reads Gmail messages through OAuth
-- Classifies mail into operational categories
-- Routes each case through a LangGraph workflow
-- Answers safe general enquiries from a local knowledge base
-- Forwards routed service requests to the operations team with a 2-hour SLA
-- Holds unclear or risky cases for manager review
-- Suppresses automated, promotional, or no-action emails
-- Stores cases, decisions, actions, and audit traces in SQLite
-- Shows the queue in a Streamlit dashboard
-
-## Basic Architecture
-
-```text
-Gmail
-  -> Poller
-  -> LangGraph workflow
-  -> SQLite
+Gmail inbox
+  -> poller duplicate check
+  -> mail_reader
+  -> Groq structured classifier
+  -> deterministic classification auditor
+  -> branch agent
+  -> case auditor
+  -> optional Gmail reply or internal forward
+  -> SQLite case log
   -> Streamlit dashboard
-
-Optional safe reply
-  -> Gmail send
-
-Routed service request
-  -> requester confirmation
-  -> internal team forward
-  -> 2-hour SLA timer
 ```
 
-Runtime services:
+The classifier proposes `request_type`, urgency, confidence, tags, details, and rationale. The classification auditor then scans the subject/body for deterministic warehouse signals and can correct the route before any branch runs. The branch agent creates the remediation actions, customer draft, internal note, SLA/follow-up markers, and audit trace. The final case auditor verifies the branch produced the minimum required outputs before the case can be stored or sent.
 
-- `api`: FastAPI backend for health checks, Gmail polling, OAuth callback, and case APIs
-- `dashboard`: Streamlit UI for the demo dashboard
-- `poller`: background worker that checks Gmail automatically
-- `data/`: private runtime database, logs, and Gmail token
-- `secrets/`: private OAuth client JSON
+## Classification Logic
 
-## Agent Workflow
+Inbox AI supports six branch types:
 
-```mermaid
-flowchart TD
-    gmail["Gmail message"] --> poller["Poller"]
-    poller --> reader["Mail Reader Agent"]
-    reader --> classifier["Classifier Agent"]
-    classifier --> classAudit{"Classification Auditor"}
+| Branch | Signal | Urgency | Automation rule |
+| --- | --- | --- | --- |
+| Complaint | Dissatisfaction, dispute, chargeback, damaged or missing freight, receiving discrepancy | High | Draft acknowledgement and route to operations lead; human review required. |
+| General Enquiry | Informational warehouse question about hours, documents, labels, check-in, appointment process, or policy | Low | Search the local KB and answer only when the evidence gate says the facts are sufficient. |
+| Service Request | Request to schedule, reschedule, cancel, update, investigate, release, receive, count, repair, reprint, or coordinate warehouse work | Medium | Extract required details, route to dock planning or operations, confirm receipt, and set a 2-hour SLA. |
+| Escalation | Active safety, security, legal, regulatory, hazmat, blocked-operations, supervisor, or executive issue | Critical | Pause automation, notify supervisor, and keep the case in human review. |
+| No Action | Automated mail, FYI-only note, receipt, delivery/bounce notification, newsletter, promotion, OTP/security alert, or explicit no-action language | Low | Log and close without customer response. |
+| Unknown | Low confidence, conflicting signals, or possibly relevant email without enough intent/details | Medium | Hold automation and route to a warehouse operator with a suggested holding reply. |
 
-    classAudit -->|"General Enquiry"| general["General Enquiry Agent"]
-    classAudit -->|"Service Request"| service["Service Request Agent"]
-    classAudit -->|"Complaint"| complaint["Complaint Agent"]
-    classAudit -->|"Escalation"| escalation["Escalation Agent"]
-    classAudit -->|"No Action"| noAction["No Action Agent"]
-    classAudit -->|"Unclear"| unknown["Human Review Agent"]
+Route precedence is deterministic: explicit no-action evidence closes the case; critical escalation evidence outranks the remaining operational branches; complaint evidence outranks service and enquiry; service actions outrank informational questions. The word `urgent` alone does not create an Escalation, and unsupported `No Action` classifications are downgraded to `Unknown`.
 
-    general --> kb["Warehouse Knowledge Base"]
-    kb --> evidence{"Enough evidence?"}
-    evidence -->|"Yes"| safeReply["Safe reply"]
-    evidence -->|"No"| managerReview["Manager Review"]
+## Remediation Strategy
 
-    service --> routeTeam["Forward to team"]
-    service --> requesterConfirm["Requester confirmation"]
-    complaint --> managerReview
-    escalation --> managerReview
-    unknown --> managerReview
-    noAction --> close["Close without reply"]
+| Branch | Remediation output |
+| --- | --- |
+| Complaint | Acknowledge receipt, prepare operations-lead escalation, log a high-priority case, and set a 2-hour follow-up marker. |
+| General Enquiry | Classify the sub-topic, search `app/core/knowledge/catalog.py`, run the evidence gate, answer from KB facts only, or route to human review if facts are missing. |
+| Service Request | Extract appointment/ASN/PO/action/time details, validate required references, prepare requester confirmation, forward an internal routing note, and set a 2-hour SLA. |
+| Escalation | Draft urgent acknowledgement, prepare supervisor alert, set `auto_resolution_paused`, and keep the case as `Needs Human`. |
+| No Action | Record the reason, suppress outbound response, and close as `No Action Closed`. |
+| Unknown | Hold automation, route to manager review, and draft a non-committal holding reply for the operator. |
 
-    safeReply --> caseAudit["Case Auditor"]
-    routeTeam --> caseAudit
-    requesterConfirm --> caseAudit
-    managerReview --> caseAudit
-    close --> caseAudit
+## Tools Used
 
-    caseAudit --> sqlite["SQLite case log"]
-    sqlite --> dashboard["Streamlit dashboard"]
-    safeReply --> gmailSend["Optional Gmail send"]
-```
+- **Gmail API + OAuth** for reading messages, replying to requesters, and forwarding internal notifications.
+- **LangGraph** for the agent workflow and branch routing.
+- **Groq / ChatGroq** for structured classification, evidence checks, extraction, and reply drafting.
+- **Deterministic signal scanner** in `app/core/classification/engine.py` for audit corrections and safety precedence.
+- **Local warehouse knowledge base** in `app/core/knowledge/catalog.py` for bounded General Enquiry answers.
+- **SQLite** for case records, payload JSON, poll errors, and audit history.
+- **FastAPI** for health, status, cases, Gmail polling, and OAuth callback endpoints.
+- **Streamlit** for the operator dashboard: inbox queue, manager review, assistant replies, metrics, workflow, and setup.
+- **Docker Compose** for running the API, dashboard, and poller services.
 
-Supported branches:
+## End-To-End Examples
 
-- `General Enquiry`: answers from the knowledge base only when evidence is strong
-- `Service Request`: extracts operational details, forwards the case to the team, confirms receipt to the requester, and sets a 2-hour SLA
-- `Complaint`: prepares manager-facing review actions
-- `Escalation`: flags urgent warehouse issues for human attention
-- `No Action`: closes newsletters, receipts, automated alerts, and unrelated mail
-- `Unknown`: sends unclear cases to human review
+| Branch | Example email | Workflow result |
+| --- | --- | --- |
+| Complaint | "Receiving discrepancy for ASN WHX9021. We delivered 24 pallets, receiving shows 21, and three cartons were damaged. This is creating a chargeback dispute." | Classified `Complaint / High`, acknowledgement drafted, operations lead escalation prepared, 2-hour follow-up set, status `Needs Human`. |
+| General Enquiry | "Can you confirm what documents a driver needs at carrier check-in for an inbound load? Are BOL, ASN, PO, and photo ID required?" | Classified `General Enquiry / Low`, KB article `Carrier Check-In Requirements` used, evidence gate passes, response generated, status `Resolved`. |
+| Service Request | "Please reschedule inbound appointment FC-NYC9-3812 for ASN WHX3344 and PO 128900 from July 12 at 08:00 to July 13 after 14:00." | Classified `Service Request / Medium`, details extracted, dock planning note created, requester confirmation drafted, 2-hour SLA set, status `Routed`. |
+| Escalation | "Active hazmat spill near dock door 4. Two outbound lanes are blocked and supervisor attention is needed immediately." | Classified `Escalation / Critical`, urgent acknowledgement drafted, supervisor notification prepared, automation paused, status `Needs Human`. |
+| No Action | "This is an automated notification. Your monthly billing statement is available. No action is required from Warehouse Operations." | Classified `No Action / Low`, response suppressed, case logged and closed as `No Action Closed`. |
+| Unknown | "This is urgent, but I do not have the location, appointment reference, or actual request details yet. I will send more context later." | Classified `Unknown / Medium`, automation held, operator review requested, suggested holding reply drafted, status `Needs Human`. |
 
-## Safety Behavior
-
-Inbox AI does not blindly answer every email.
-
-- If the knowledge base cannot answer a General Enquiry, the case goes to human review.
-- Complaint, Escalation, Unknown, and Needs Human cases are not auto-sent.
-- Routed Service Requests can send a requester confirmation and an internal team forward.
-- No Action emails are logged and closed without a reply.
-- Every case keeps an agent trace so the decision can be inspected.
-- Cases confirmed by the manager leave the dashboard queues but remain stored in SQLite for audit.
-
-## Run Locally
-
-The app runs with Docker Compose:
-
-```bash
-docker compose up --build -d
-```
-
-Open:
-
-```text
-Dashboard: http://localhost:8502
-API:       http://localhost:8501
-```
-
-Private runtime files are intentionally not committed:
-
-- `.env`
-- `data/`
-- `secrets/`
-
-## Deployment Shape
-
-For the hosted demo, Docker Compose runs the API, dashboard, and poller on the server. Nginx exposes the public HTTPS domain:
-
-```text
-https://inboxai.devcrew.dev/       -> Streamlit dashboard
-https://inboxai.devcrew.dev/api/*  -> FastAPI backend
-```
-
-The Nginx site config lives at:
-
-```text
-deploy/nginx/inboxai.devcrew.dev.conf
-```
-
-## Project Layout
-
-```text
-app/main.py              FastAPI app
-app/dashboard/           Streamlit dashboard
-app/common/              Gmail, polling, storage, settings, LLM helpers
-app/core/workflow/       LangGraph workflow and branch agents
-app/core/knowledge/      Local warehouse knowledge base
-deploy/nginx/            Nginx config for hosted demo
-tests/                   Workflow, Gmail, UI, LLM, and KB tests
-```
+Run locally with `docker compose up --build -d`, then open the dashboard at `http://localhost:8502` and the API at `http://localhost:8501`.
