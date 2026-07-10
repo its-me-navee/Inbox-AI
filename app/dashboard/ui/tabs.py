@@ -24,6 +24,7 @@ from app.dashboard.ui.case_views import (
     render_case_detail,
     render_reply_workspace,
     render_review_workspace,
+    sort_records_by_recent,
     sort_records_by_urgency,
     team_forward_target,
 )
@@ -54,6 +55,9 @@ ACTIVE_SENT_REPLY_KEY = "active_sent_reply_case_id"
 FLASH_TTL_SECONDS = 3.0
 ROUTED_STATUS = "Routed"
 CONFIRM_REVIEW_STATUSES = {"Resolved", "No Action Closed"}
+INBOX_SORT_RECENT = "Recent first"
+INBOX_SORT_URGENCY = "Urgency first"
+INBOX_SORT_OPTIONS = (INBOX_SORT_RECENT, INBOX_SORT_URGENCY)
 
 
 def render_requester_email(column: Any, requester: str) -> None:
@@ -167,20 +171,30 @@ def inbox_table_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return records
 
 
+def sort_inbox_records(records: list[dict[str, Any]], sort_mode: str) -> list[dict[str, Any]]:
+    if sort_mode == INBOX_SORT_URGENCY:
+        return sort_records_by_urgency(records)
+    return sort_records_by_recent(records)
+
+
 def render_inbox_tab(records: list[dict[str, Any]]) -> None:
     render_metrics_row(records)
     st.divider()
     inbox_records = inbox_table_records(records)
-    fc = st.columns([0.25, 0.25, 0.4, 0.1])
+    fc = st.columns([0.21, 0.21, 0.32, 0.16, 0.1])
     statuses = sorted({str(r.get("status")) for r in inbox_records if r.get("status")})
     types = sorted({str((r.get("classification") or {}).get("request_type")) for r in inbox_records if (r.get("classification") or {}).get("request_type")})
     sel_status = fc[0].multiselect("Status", statuses, placeholder="All", format_func=status_label)
     sel_type = fc[1].multiselect("Type", types, placeholder="All", format_func=type_label)
     search = fc[2].text_input("Search", placeholder="Subject, requester, body…")
-    if fc[3].button("Refresh", width="stretch"):
+    sort_mode = fc[3].selectbox("Sort", INBOX_SORT_OPTIONS)
+    if fc[4].button("Refresh", width="stretch"):
         st.rerun()
 
-    visible = filtered_records(inbox_records, statuses=sel_status, request_types=sel_type, search=search)
+    visible = sort_inbox_records(
+        filtered_records(inbox_records, statuses=sel_status, request_types=sel_type, search=search),
+        sort_mode,
+    )
     if not records:
         render_empty_state("No cases yet", "Sync Gmail to let the assistant classify incoming requests.")
         return
@@ -217,7 +231,7 @@ def render_inbox_queue(records: list[dict[str, Any]]) -> None:
     header[5].markdown("**Requester**")
     header[6].markdown("**Status**")
 
-    for record in sort_records_by_urgency(records):
+    for record in records:
         case = case_from_record(record)
         cols = st.columns([0.09, 0.18, 0.12, 0.12, 0.29, 0.12, 0.08])
         if cols[0].button("Open", key=f"inbox-open-{case.id}", width="stretch"):

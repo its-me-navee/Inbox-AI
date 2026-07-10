@@ -1,7 +1,13 @@
 from __future__ import annotations
 
 from app.dashboard.ui.case_views import operator_log_line, selected_row_index, sort_records_by_urgency
-from app.dashboard.ui.tabs import inbox_resolution_action_label, inbox_table_records
+from app.dashboard.ui.tabs import (
+    INBOX_SORT_RECENT,
+    INBOX_SORT_URGENCY,
+    inbox_resolution_action_label,
+    inbox_table_records,
+    sort_inbox_records,
+)
 
 
 def test_sort_records_by_urgency_orders_highest_priority_first() -> None:
@@ -15,6 +21,29 @@ def test_sort_records_by_urgency_orders_highest_priority_first() -> None:
     sorted_records = sort_records_by_urgency(records)
 
     assert [record["subject"] for record in sorted_records] == ["critical", "high", "medium", "low"]
+
+
+def test_sort_inbox_records_defaults_to_recent_messages_first() -> None:
+    records = [
+        {"subject": "older", "received_at": "2026-07-08 08:00 UTC", "classification": {"urgency": "Critical"}},
+        {"subject": "newer", "received_at": "2026-07-09 08:00 UTC", "classification": {"urgency": "Low"}},
+        {"subject": "fallback", "created_at": "2026-07-09 07:00 UTC", "classification": {"urgency": "High"}},
+    ]
+
+    sorted_records = sort_inbox_records(records, INBOX_SORT_RECENT)
+
+    assert [record["subject"] for record in sorted_records] == ["newer", "fallback", "older"]
+
+
+def test_sort_inbox_records_can_still_use_urgency_order() -> None:
+    records = [
+        {"subject": "low", "received_at": "2026-07-10 08:00 UTC", "classification": {"urgency": "Low"}},
+        {"subject": "critical", "received_at": "2026-07-09 08:00 UTC", "classification": {"urgency": "Critical"}},
+    ]
+
+    sorted_records = sort_inbox_records(records, INBOX_SORT_URGENCY)
+
+    assert [record["subject"] for record in sorted_records] == ["critical", "low"]
 
 
 def test_selected_row_index_falls_back_when_selection_is_stale() -> None:

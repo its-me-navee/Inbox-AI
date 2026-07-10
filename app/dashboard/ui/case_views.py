@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import time
 from dataclasses import fields
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from html import escape
 from typing import Any
 
@@ -99,6 +101,32 @@ def urgency_rank(record: dict[str, Any]) -> int:
 
 def sort_records_by_urgency(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return sorted(records, key=urgency_rank)
+
+
+def record_received_text(record: dict[str, Any]) -> str:
+    return str(record.get("received_at") or record.get("created_at") or "").strip()
+
+
+def record_time_sort_key(record: dict[str, Any]) -> float:
+    value = record_received_text(record)
+    if not value:
+        return float("-inf")
+    for fmt in ("%Y-%m-%d %H:%M UTC", "%Y-%m-%d %H:%M:%S"):
+        try:
+            return datetime.strptime(value, fmt).replace(tzinfo=timezone.utc).timestamp()
+        except ValueError:
+            pass
+    try:
+        parsed = parsedate_to_datetime(value)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc).timestamp()
+    except (TypeError, ValueError):
+        return float("-inf")
+
+
+def sort_records_by_recent(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return sorted(records, key=record_time_sort_key, reverse=True)
 
 
 def selected_row_index(selected_rows: list[int], record_count: int) -> int:
